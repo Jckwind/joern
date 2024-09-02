@@ -6,9 +6,11 @@ import io.joern.x2cpg.frontendspecific.pysrc2cpg
 import io.joern.x2cpg.frontendspecific.pysrc2cpg.*
 import io.joern.x2cpg.passes.base.AstLinkerPass
 import io.joern.x2cpg.passes.callgraph.NaiveCallLinker
-import io.joern.x2cpg.passes.frontend.XTypeRecoveryConfig
+import io.joern.x2cpg.passes.frontend.{XTypeRecoveryConfig, TypeRecoveryParserConfig}
 import io.shiftleft.codepropertygraph.generated.Cpg
-
+import io.joern.x2cpg.{X2Cpg, X2CpgConfig}
+import scopt.OParser
+import java.nio.file.Paths
 import java.nio.file.Path
 import scala.util.Try
 import scala.compiletime.uninitialized
@@ -19,9 +21,11 @@ case class PythonSrcCpgGenerator(config: FrontendConfig, rootPath: Path) extends
 
   /** Generate a CPG for the given input path. Returns the output path, or None, if no CPG was generated.
     */
+  val first_two_params = config.cmdLineParams.toSeq.take(2)
+  val params = config.cmdLineParams.toSeq.drop(2)
   override def generate(inputPath: String, outputPath: String = "cpg.bin.zip"): Try[String] = {
-    typeRecoveryConfig = XTypeRecoveryConfig.parse(config.cmdLineParams.toSeq)
-    val arguments = Seq(inputPath, "-o", outputPath) ++ config.cmdLineParams
+    typeRecoveryConfig = XTypeRecoveryConfig.parse(first_two_params)
+    val arguments = Seq(inputPath, "-o", outputPath) ++ params
     runShellCommand(command.toString, arguments).map(_ => outputPath)
   }
 
