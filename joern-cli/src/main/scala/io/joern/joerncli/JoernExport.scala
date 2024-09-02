@@ -7,7 +7,7 @@ import flatgraph.formats.ExportResult
 import flatgraph.formats.dot.DotExporter
 import flatgraph.formats.graphml.GraphMLExporter
 import flatgraph.formats.graphson.GraphSONExporter
-import flatgraph.formats.neo4jcsv.{ColumnDefinitions, ColumnType, DataFileSuffix, HeaderFileSuffix, CypherFileSuffix}
+import flatgraph.formats.neo4jcsv.{ColumnDefinitions, ColumnType, HeaderFileSuffix, DataFileSuffix}
 import io.joern.dataflowengineoss.DefaultSemantics
 import io.joern.dataflowengineoss.layers.dataflows.*
 import io.joern.dataflowengineoss.semanticsloader.Semantics
@@ -290,6 +290,7 @@ object JoernExport {
 object Neo4jCsvExporter extends Exporter {
 
   override def defaultFileExtension: String = "csv"
+
   /**
     *
     * For both nodes and relationships, we first write the data file and to derive the property types from their runtime types. We will
@@ -323,12 +324,11 @@ object Neo4jCsvExporter extends Exporter {
   private def exportNodes(nodes: IterableOnce[GNode], label: String, schema: Schema, outDir: Path): CountAndFiles = {
     val dataFile = outDir.resolve(s"nodes_${label}${DataFileSuffix}.csv")
     val headerFile = outDir.resolve(s"nodes_${label}${HeaderFileSuffix}.csv")
-    val cypherFile = outDir.resolve(s"nodes_${label}${CypherFileSuffix}.csv")
 
     Files.createDirectories(dataFile.getParent)
 
     val propertyNames = schema.getNodePropertyNames(label)
-    val columnDefinitions: Map[String, String] = propertyNames.map(prop => prop -> "String").toMap
+    val columnDefinitions = new ColumnDefinitions(propertyNames.toList)
     var nodeCount = 0
 
     Using(CSVWriter.open(dataFile.toFile)) { writer =>
@@ -336,11 +336,8 @@ object Neo4jCsvExporter extends Exporter {
         nodes.iterator.foreach { node =>
           try {
             val specialColumns = Seq(node.id.toString, node.label)
-            val propertyValueColumns = propertyNames.zipWithIndex.map { case (prop, index) =>
-              val value = Accessors.getNodeProperty(node, index)
-              convertToString(value)
-            }.toSeq
-
+            var properties = Accessors.getNodeProperties(node).toMap
+            val propertyValueColumns = columnDefinitions.propertyValues(node.propertyOption)
             writer.writeRow(specialColumns ++ propertyValueColumns)
             nodeCount += 1
           } catch {
@@ -365,41 +362,8 @@ object Neo4jCsvExporter extends Exporter {
       return CountAndFiles(0, Seq.empty)
     }
 
-    writeSingleLineCsv(headerFile, Seq("Id:ID", "Label") ++ columnDefinitions.keys.map(prop => s"$prop:String"))
-
-    val cypherPropertyMappings = columnDefinitions.keys.zipWithIndex.map { case (prop, index) =>
-      s"$prop: line[${index + 2}]"
-    }.mkString(",\n")
-    val relative_parent = dataFile.getParent().getParent().relativize(outDir)
-    val cypherQuery =
-      s"""LOAD CSV FROM 'file:///nodes_${label}_data.csv' AS line
-        |CREATE (:$label {
-        |id: toInteger(line[0]),
-        |$cypherPropertyMappings
-        |});
-        |""".stripMargin
-    writeFile(cypherFile, cypherQuery)
-
-    CountAndFiles(nodeCount, Seq(headerFile, dataFile, cypherFile))
-  }
-
-  private def convertToString(value: Any): String = {
-    value match {
-      case null => ""
-      case v: String => v
-      case v: Int => v.toString
-      case v: Long => v.toString
-      case v: Boolean => v.toString
-      case v: Double => v.toString
-      case v: Float => v.toString
-      case v: Seq[_] => v.map(convertToString).mkString(",")
-      case v: Option[_] => v.map(convertToString).getOrElse("")
-      case v: Array[_] => v.map(convertToString).mkString(",")
-      case v: GNode => v.id.toString
-      case v =>
-        println(s"Unhandled type: ${v.getClass.getName}, using default toString conversion.")
-        v.toString
-    }
+    writeSingleLineCsv(headerFile, Seq(ColumnType.Id, ColumnType.Label) ++ columnDefinitions.propertiesWithTypes)
+    CountAndFiles(nodeCount, Seq(headerFile, dataFile))
   }
 
   /** write edges of all labels */
@@ -415,18 +379,16 @@ object Neo4jCsvExporter extends Exporter {
           val headerFile        = outputRootDirectory.resolve(s"edges_$label$HeaderFileSuffix.csv")
           // header file to be written at the very end, with complete ColumnDefByName
           val dataFile          = outputRootDirectory.resolve(s"edges_$label$DataFileSuffix.csv")
-          val cypherFile        = outputRootDirectory.resolve(s"edges_$label$CypherFileSuffix.csv")
           val dataFileWriter    = CSVWriter.open(dataFile.toFile, append = false)
           val columnDefinitions = new ColumnDefinitions(edge.propertyName.toList) // flatgraph only supports edges with 1 property
           println(s"label: $label")
           println(s"edge.propertyName: ${edge.propertyName}")
           println(s"columnDefinitions: ${columnDefinitions.propertiesWithTypes}")
-          EdgeFilesContext(label, headerFile, dataFile, cypherFile, dataFileWriter, columnDefinitions)
+          EdgeFilesContext(label, headerFile, dataFile, dataFileWriter, columnDefinitions)
         }
       )
 
       val specialColumns = Seq(edge.src.id.toString, edge.dst.id.toString, edge.label)
-      edge.propertyName.foreach(println)
       val propertyValueColumns = context.columnDefinitions.propertyValues { propertyName =>
         edge.propertyName.flatMap { edgePropertyName =>
           if (propertyName == edgePropertyName)
@@ -440,26 +402,14 @@ object Neo4jCsvExporter extends Exporter {
     }
 
     val files = edgeFilesContextByLabel.values.flatMap {
-      case EdgeFilesContext(label, headerFile, dataFile, cypherFile, dataFileWriter, columnDefinitions) =>
+      case EdgeFilesContext(label, headerFile, dataFile, dataFileWriter, columnDefinitions) =>
         println(s"columnDefinitions: ${columnDefinitions.propertiesWithTypes}")
         writeSingleLineCsv(headerFile, Seq(ColumnType.StartId, ColumnType.EndId, ColumnType.Type) ++ columnDefinitions.propertiesWithTypes)
 
         dataFileWriter.flush()
         dataFileWriter.close()
 
-        // write cypher file for import into neo4j
-        // starting with index=3, because 0|1|2 are taken by 'special' columns StartId|EndId|Type
-        val relative_parent = dataFile.getParent().getParent().relativize(outputRootDirectory)
-        val cypherPropertyMappings = columnDefinitions.propertiesMappingsForCypher(startIndex = 3).mkString(",\n")
-        val cypherQuery =
-          s"""LOAD CSV FROM 'file:///edges_${label}_data.csv' AS line
-             |MATCH (a), (b)
-             |WHERE a.id = toInteger(line[0]) AND b.id = toInteger(line[1])
-             |CREATE (a)-[r:$label {$cypherPropertyMappings}]->(b);
-             |""".stripMargin
-        writeFile(cypherFile, cypherQuery)
-
-        Seq(headerFile, dataFile, cypherFile)
+        Seq(headerFile, dataFile)
     }.toSeq
 
     CountAndFiles(count, files)
@@ -479,7 +429,6 @@ object Neo4jCsvExporter extends Exporter {
     label: String,
     headerFile: Path,
     dataFile: Path,
-    cypherFile: Path,
     dataFileWriter: CSVWriter,
     columnDefinitions: ColumnDefinitions
   )
