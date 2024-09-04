@@ -104,9 +104,9 @@ abstract class XInheritanceFullNamePass(cpg: Cpg) extends ForkJoinParallelCpgPas
     combinedPath.split(pathSep).lastOption match {
       case Some(tName) =>
         (
-          tName,
-          combinedPath
-            .stripSuffix(s"$pathSep$tName")
+            tName,
+            combinedPath
+                .stripSuffix(s"$pathSep$tName")
             .replaceAll(s"${Pattern.quote(pathSep.toString)}", Matcher.quoteReplacement(File.separator)) +
             Seq(s"$fileExt$fileModuleSep$moduleName", tName).mkString(pathSep.toString)
         )

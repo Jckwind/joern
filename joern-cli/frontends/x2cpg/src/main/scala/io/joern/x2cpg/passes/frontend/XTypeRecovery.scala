@@ -150,6 +150,11 @@ abstract class XTypeRecoveryPassGenerator[CompilationUnitType <: AstNode](
 ) {
 
   def generate(): List[CpgPassBase] = {
+    // Ensure that the config is not null before proceeding
+    if (config == null) {
+      throw new IllegalArgumentException("XTypeRecoveryConfig cannot be null")
+    }
+
     val state = new XTypeRecoveryState(config)
     val res   = mutable.ArrayBuffer[CpgPassBase]()
     for (i <- Range(0, config.iterations)) {

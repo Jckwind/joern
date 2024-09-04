@@ -71,6 +71,9 @@ object JoernParse {
     val (parserArgs, frontendArgs) = CpgBasedTool.splitArgs(args)
     val installConfig              = new InstallConfig()
 
+    println(s"parserArgs: ${parserArgs.mkString(",")}")
+    println(s"frontendArgs: ${frontendArgs.mkString(",")}")
+
     parseConfig(parserArgs).flatMap { config =>
       if (config.listLanguages)
         Try(buildLanguageList())

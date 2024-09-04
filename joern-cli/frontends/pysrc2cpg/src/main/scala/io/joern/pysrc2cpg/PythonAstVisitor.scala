@@ -93,7 +93,7 @@ class PythonAstVisitor(
     edgeBuilder.astEdge(namespaceBlockNode, fileNode, 1)
     contextStack.setFileNamespaceBlock(namespaceBlockNode)
 
-    val methodFullName = calculateFullNameFromContext("<module>")
+    val methodFullName = calculateFullNameFromContext(Constants.moduleName)
 
     val firstLineAndCol = module.stmts.headOption.map(lineAndColOf)
     val lastLineAndCol  = module.stmts.lastOption.map(lineAndColOf)
@@ -106,9 +106,9 @@ class PythonAstVisitor(
 
     val moduleMethodNode =
       createMethod(
-        "<module>",
+        Constants.moduleName,
         methodFullName,
-        Some("<module>"),
+        Some(Constants.moduleName),
         ModifierTypes.VIRTUAL :: ModifierTypes.MODULE :: Nil,
         parameterProvider = () => MethodParameters.empty(),
         bodyProvider = () => createBuiltinIdentifiers(memOpCalculator.names) ++ module.stmts.map(convert),
@@ -403,7 +403,7 @@ class PythonAstVisitor(
 
     // For every method that is a module, the local variables can be imported by other modules. This behaviour is
     // much like fields so they are to be linked as fields to this method type
-    if (name == "<module>") contextStack.createMemberLinks(typeDeclNode, edgeBuilder.astEdge)
+    if (name == Constants.moduleName) contextStack.createMemberLinks(typeDeclNode, edgeBuilder.astEdge)
 
     contextStack.pop()
     edgeBuilder.astEdge(typeDeclNode, contextStack.astParent, contextStack.order.getAndInc)
@@ -488,7 +488,7 @@ class PythonAstVisitor(
     val functions = classDef.body.collect { case func: ast.FunctionDef => func }
 
     // __init__ method has to be in functions because "async def __init__" is invalid.
-    val initFunctionOption = functions.find(_.name == "__init__")
+    val initFunctionOption = functions.find(_.name == Constants.initName)
 
     val initParameters = initFunctionOption.map(_.args).getOrElse {
       // Create arguments of a default __init__ function.
@@ -514,7 +514,7 @@ class PythonAstVisitor(
     // and we cant yet handle super().
     val fakeNewMethod = createFakeNewMethod(initParameters)
 
-    val fakeNewMember = nodeBuilder.memberNode("<fakeNew>", fakeNewMethod.fullName)
+    val fakeNewMember = nodeBuilder.memberNode("<fakeNew>", None, Some(fakeNewMethod.fullName))
     edgeBuilder.astEdge(fakeNewMember, metaTypeDeclNode, contextStack.order.getAndInc)
 
     // Create binding into class instance type for each method.
@@ -569,7 +569,7 @@ class PythonAstVisitor(
     metaTypeDecl: nodes.NewNode
   ): Unit = {
     val memberForInstance =
-      nodeBuilder.memberNode(functionName, functionDefToMethod.apply(function).fullName, lineAndColOf(function))
+      nodeBuilder.memberNode(functionName, Some(lineAndColOf(function)), Some(functionDefToMethod.apply(function).fullName))
     edgeBuilder.astEdge(memberForInstance, instanceTypeDecl, contextStack.order.getAndInc)
 
     val methodForMetaClass =
@@ -584,7 +584,7 @@ class PythonAstVisitor(
         )
       }
 
-    val memberForMeta = nodeBuilder.memberNode(functionName, methodForMetaClass.fullName, lineAndColOf(function))
+    val memberForMeta = nodeBuilder.memberNode(functionName, Some(lineAndColOf(function)), Some(methodForMetaClass.fullName))
     edgeBuilder.astEdge(memberForMeta, metaTypeDecl, contextStack.order.getAndInc)
   }
 
@@ -774,7 +774,7 @@ class PythonAstVisitor(
 
         val initCall = createXDotYCall(
           () => createIdentifierNode("cls", Load, lineAndColumn),
-          "__init__",
+          Constants.initName,
           xMayHaveSideEffects = false,
           lineAndColumn,
           argumentWithInstance,
@@ -1861,9 +1861,9 @@ class PythonAstVisitor(
       case imaginaryConstant: ast.ImaginaryConstant =>
         nodeBuilder.complexLiteralNode(imaginaryConstant.value + "j", lineAndColOf(constant))
       case ast.NoneConstant =>
-        nodeBuilder.literalNode("None", None, lineAndColOf(constant))
+        nodeBuilder.literalNode("None", List(Constants.ANY), lineAndColOf(constant))
       case ast.EllipsisConstant =>
-        nodeBuilder.literalNode("...", None, lineAndColOf(constant))
+        nodeBuilder.literalNode("...", List(Constants.ANY), lineAndColOf(constant))
     }
   }
 
@@ -1890,7 +1890,7 @@ class PythonAstVisitor(
     contextStack.findEnclosingTypeDecl() match {
       case Some(typeDecl: NewTypeDecl) =>
         if (!members.contains(typeDecl) || !members(typeDecl).contains(name)) {
-          val member = nodeBuilder.memberNode(name, lineAndCol)
+          val member = nodeBuilder.memberNode(name, Some(lineAndCol))
           edgeBuilder.astEdge(member, typeDecl, contextStack.order.getAndInc)
           members(typeDecl) = members.getOrElse(typeDecl, List()) ++ List(name)
         }
@@ -1902,9 +1902,9 @@ class PythonAstVisitor(
     subscript.slice match {
       case slice: ast.Slice =>
         val value = convert(subscript.value)
-        val lower = slice.lower.map(convert).getOrElse(nodeBuilder.literalNode("None", None, noLineAndColumn))
-        val upper = slice.upper.map(convert).getOrElse(nodeBuilder.literalNode("None", None, noLineAndColumn))
-        val step  = slice.step.map(convert).getOrElse(nodeBuilder.literalNode("None", None, noLineAndColumn))
+        val lower = slice.lower.map(convert).getOrElse(nodeBuilder.literalNode("None", List(Constants.ANY), noLineAndColumn))
+        val upper = slice.upper.map(convert).getOrElse(nodeBuilder.literalNode("None", List(Constants.ANY), noLineAndColumn))
+        val step  = slice.step.map(convert).getOrElse(nodeBuilder.literalNode("None", List(Constants.ANY), noLineAndColumn))
 
         val code = nodeToCode.getCode(subscript)
         val callNode =

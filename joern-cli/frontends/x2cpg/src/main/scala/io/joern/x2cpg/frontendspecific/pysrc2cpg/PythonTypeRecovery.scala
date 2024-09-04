@@ -14,6 +14,7 @@ import io.shiftleft.semanticcpg.language.importresolver.*
 import io.shiftleft.semanticcpg.language.operatorextension.OpNodes
 import io.shiftleft.semanticcpg.language.operatorextension.OpNodes.FieldAccess
 import io.shiftleft.codepropertygraph.generated.DiffGraphBuilder
+import io.joern.x2cpg.frontendspecific.pysrc2cpg.Constants.getTypes
 
 private class PythonTypeRecovery(cpg: Cpg, state: XTypeRecoveryState, iteration: Int)
     extends XTypeRecovery[File](cpg, state, iteration) {
@@ -44,9 +45,11 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
     }
 
   override def visitImport(i: Import): Unit = {
-    if (i.importedAs.isDefined && i.importedEntity.isDefined) {
-
-      val entityName = i.importedAs.get
+    for {
+      importedAs <- i.importedAs
+      importedEntity <- i.importedEntity
+    } {
+      val entityName = importedAs
       i.call.tag.flatMap(EvaluatedImport.tagToEvaluatedImport).foreach {
         case ResolvedMethod(fullName, alias, receiver, _) => symbolTable.put(CallAlias(alias, receiver), fullName)
         case ResolvedTypeDecl(fullName, _)                => symbolTable.put(LocalVar(entityName), fullName)
@@ -56,7 +59,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
             .member
             .nameExact(memberName)
             .flatMap(m => m.typeFullName +: m.dynamicTypeHintFullName)
-            .filterNot(_ == "ANY")
+            .filterNot(_ == Constants.ANY)
             .toSet
           symbolTable.put(LocalVar(entityName), memberTypes)
         case UnknownMethod(fullName, alias, receiver, _) =>
@@ -73,11 +76,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
   override def visitAssignments(a: OpNodes.Assignment): Set[String] = {
     a.argumentOut.l match {
       case List(i: Identifier, c: Call) if c.name.isBlank && c.signature.isBlank =>
-        // This is usually some decorator wrapper
-        c.argument.isMethodRef.headOption match {
-          case Some(mRef) => visitIdentifierAssignedToMethodRef(i, mRef)
-          case None       => super.visitAssignments(a)
-        }
+        c.argument.isMethodRef.headOption.fold(super.visitAssignments(a))(visitIdentifierAssignedToMethodRef(i, _))
       case _ => super.visitAssignments(a)
     }
   }
@@ -85,8 +84,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
   /** Determines if a function call is a constructor by following the heuristic that Python classes are typically
     * camel-case and start with an upper-case character.
     */
-  override def isConstructor(c: Call): Boolean =
-    isConstructor(c.name) && c.code.endsWith(")")
+  override def isConstructor(c: Call): Boolean = isConstructor(c.name) && c.code.endsWith(")")
 
   override protected def isConstructor(name: String): Boolean =
     name.nonEmpty && name.charAt(0).isUpper
@@ -94,7 +92,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
   /** If the parent method is module then it can be used as a field.
     */
   override def isFieldUncached(i: Identifier): Boolean =
-    i.method.name.matches("(<module>|__init__)") || super.isFieldUncached(i)
+    i.method.name.matches(s"(${Constants.moduleName}|${Constants.initName})") || super.isFieldUncached(i)
 
   override def visitIdentifierAssignedToOperator(i: Identifier, c: Call, operation: String): Set[String] = {
     operation match {
@@ -102,6 +100,15 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
       case "<operator>.tupleLiteral" => associateTypes(i, Set(s"${Constants.builtinPrefix}tuple"))
       case "<operator>.dictLiteral"  => associateTypes(i, Set(s"${Constants.builtinPrefix}dict"))
       case "<operator>.setLiteral"   => associateTypes(i, Set(s"${Constants.builtinPrefix}set"))
+      case "<operator>.listComp" =>
+        val elementType = inferComprehensionElementType(c)
+        associateTypes(i, Set(s"${Constants.builtinPrefix}list[${elementType}]"))
+      case "<operator>.setComp" =>
+        val elementType = inferComprehensionElementType(c)
+        associateTypes(i, Set(s"${Constants.builtinPrefix}set[${elementType}]"))
+      case "<operator>.dictComp" =>
+        val (keyType, valueType) = inferDictComprehensionTypes(c)
+        associateTypes(i, Set(s"${Constants.builtinPrefix}dict[${keyType}, ${valueType}]"))
       case Operators.conditional     => associateTypes(i, Set(s"${Constants.builtinPrefix}bool"))
       case Operators.indexAccess =>
         c.argument.argumentIndex(1).isCall.foreach(setCallMethodFullNameFromBase)
@@ -110,8 +117,18 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
     }
   }
 
+  private def inferComprehensionElementType(c: Call): String = {
+    c.argument.headOption.flatMap(x => getTypes(x).headOption).getOrElse(Constants.ANY)
+  }
+
+  private def inferDictComprehensionTypes(c: Call): (String, String) = {
+    val keyType = c.argument.headOption.flatMap(x => getTypes(x).headOption).getOrElse(Constants.ANY)
+    val valueType = c.argument.toList.lift(1).flatMap(x => getTypes(x).headOption).getOrElse(Constants.ANY)
+    (keyType, valueType)
+  }
+
   override def visitIdentifierAssignedToConstructor(i: Identifier, c: Call): Set[String] = {
-    val constructorPaths = symbolTable.get(c).map(_.stripSuffix(s"${pathSep}__init__"))
+    val constructorPaths = symbolTable.get(c).map(_.stripSuffix(s"$pathSep${Constants.initName}"))
     associateTypes(i, constructorPaths)
   }
 
@@ -120,7 +137,18 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
     if (c.name.equals("import")) Set.empty
     // Stop custom annotation representation from hitting superclass
     else if (c.name.isBlank) Set.empty
-    else super.visitIdentifierAssignedToCall(i, c)
+    else {
+      c.name match {
+        case "len" => associateTypes(i, Set(s"${Constants.builtinPrefix}int"))
+        case "type" => associateTypes(i, Set(s"${Constants.builtinPrefix}type"))
+        case "isinstance" => associateTypes(i, Set(s"${Constants.builtinPrefix}bool"))
+        case "sorted" | "reversed" =>
+          val argType = c.argument.headOption.flatMap(x => getTypes(x).headOption).getOrElse(Constants.ANY)
+          associateTypes(i, Set(s"${Constants.builtinPrefix}list[$argType]"))
+        // ... handle other common built-in functions ...
+        case _ => super.visitIdentifierAssignedToCall(i, c)
+      }
+    }
   }
 
   override def visitIdentifierAssignedToFieldLoad(i: Identifier, fa: FieldAccess): Set[String] = {
@@ -144,7 +172,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
   }
 
   override def getFieldParents(fa: FieldAccess): Set[String] = {
-    if (fa.method.name == "<module>") {
+    if (fa.method.name == Constants.moduleName) {
       Set(fa.method.fullName)
     } else if (fa.method.typeDecl.nonEmpty) {
       val parentTypes       = fa.method.typeDecl.fullName.toSet
@@ -159,27 +187,33 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
     (s.startsWith("\"") || s.startsWith("'")) && (s.endsWith("\"") || s.endsWith("'"))
 
   override def getLiteralType(l: Literal): Set[String] = {
-    val literalTypes = (l.code match {
-      case code if code.toIntOption.isDefined                  => Some(s"${Constants.builtinPrefix}int")
-      case code if code.toDoubleOption.isDefined               => Some(s"${Constants.builtinPrefix}float")
-      case code if "True".equals(code) || "False".equals(code) => Some(s"${Constants.builtinPrefix}bool")
-      case code if code.equals("None")                         => Some(s"${Constants.builtinPrefix}None")
-      case code if isPyString(code)                            => Some(s"${Constants.builtinPrefix}str")
-      case _                                                   => None
-    }).toSet
+    val literalType = l.code match {
+      case code if code.toIntOption.isDefined    => s"${Constants.builtinPrefix}int"
+      case code if code.toDoubleOption.isDefined => s"${Constants.builtinPrefix}float"
+      case "True" | "False"                      => s"${Constants.builtinPrefix}bool"
+      case "None"                                => s"${Constants.builtinPrefix}None"
+      case code if isPyString(code)              => s"${Constants.builtinPrefix}str"
+      case code if code.startsWith("Union[") =>
+        val types = code.stripPrefix("Union[").stripSuffix("]").split(",").map(_.trim)
+        return types.map(t => s"${Constants.builtinPrefix}$t").toSet
+      case _                                     => return Set.empty
+    }
+    val literalTypes = Set(literalType)
     setTypes(l, literalTypes.toSeq)
     literalTypes
   }
 
   override def createCallFromIdentifierTypeFullName(typeFullName: String, callName: String): String = {
-    lazy val tName = typeFullName.split("\\.").lastOption.getOrElse(typeFullName)
+    lazy val typeName = typeFullName.split("\\.").lastOption.getOrElse(typeFullName)
     typeFullName match {
-      case t if t.matches(".*(<\\w+>)$") => super.createCallFromIdentifierTypeFullName(typeFullName, callName)
-      case t if t.matches(".*\\.<(member|returnValue|indexAccess)>(\\(.*\\))?") =>
+      case fullName if fullName.matches(".*(<\\w+>)$") =>
         super.createCallFromIdentifierTypeFullName(typeFullName, callName)
-      case t if isConstructor(tName) =>
-        Seq(t, callName).mkString(pathSep)
-      case _ => super.createCallFromIdentifierTypeFullName(typeFullName, callName)
+      case fullName if fullName.matches(".*\\.<(member|returnValue|indexAccess)>(\\(.*\\))?") =>
+        super.createCallFromIdentifierTypeFullName(typeFullName, callName)
+      case fullName if isConstructor(typeName) =>
+        Seq(fullName, callName).mkString(pathSep)
+      case _ =>
+        super.createCallFromIdentifierTypeFullName(typeFullName, callName)
     }
   }
 
@@ -204,7 +238,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
           .foreach { cls =>
             val clsPath = classMethod.typeDecl.fullName.toSet
             symbolTable.put(LocalVar(cls.name), clsPath)
-            if (cls.typeFullName == "ANY")
+            if (cls.typeFullName == Constants.ANY)
               builder.setNodeProperty(cls, PropertyNames.DYNAMIC_TYPE_HINT_FULL_NAME, clsPath.toSeq)
           }
     }
@@ -224,7 +258,7 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
     funcName: String,
     baseName: Option[String]
   ): Unit = {
-    if (funcName != "<module>")
+    if (funcName != Constants.moduleName)
       super.handlePotentialFunctionPointer(funcPtr, baseTypes, funcName, baseName)
   }
 
@@ -233,6 +267,15 @@ private class RecoverForPythonFile(cpg: Cpg, cu: File, builder: DiffGraphBuilder
       case Some(c) => getTypesFromCall(c).map(x => s"$x$pathSep${XTypeRecovery.DummyIndexAccess}")
       case _       => super.getIndexAccessTypes(ia)
     }
+  }
+
+  def visitIdentifierAssignedToLambda(i: Identifier, l: AstNode): Set[String] = {
+    val returnType = inferLambdaReturnType(l)
+    associateTypes(i, Set(s"${Constants.builtinPrefix}function[${returnType}]"))
+  }
+
+  private def inferLambdaReturnType(l: AstNode): String = {
+    l.astChildren.lastOption.flatMap(x => getTypes(x).headOption).getOrElse(Constants.ANY)
   }
 
 }

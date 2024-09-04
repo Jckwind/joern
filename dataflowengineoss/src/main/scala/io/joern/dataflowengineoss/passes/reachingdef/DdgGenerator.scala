@@ -349,11 +349,13 @@ private class UsageAnalyzer(
   /** Compares arguments of calls with incoming definitions to see if they refer to the same variable
     */
   private def sameVariable(use: StoredNode, inElement: StoredNode): Boolean = {
+    // println("\n" + use.label + " node with properties " + use.properties
+    //   + "\n uses " + inElement.label + " node with properties " + inElement.properties + "\n\n")
     inElement match {
       case param: MethodParameterIn =>
         nodeToString(use).contains(param.name)
       case call: Call if indirectionAccessSet.contains(call.name) =>
-        call.argumentOption(1).exists(x => nodeToString(use).contains(x.code))
+        call.ast.isCall.argument.exists(x => nodeToString(use).contains(x.code) || nodeToString(use).contains(x.properties.getOrElse("ARGUMENT_NAME", "")))
       case call: Call =>
         nodeToString(use).contains(call.code)
       case identifier: Identifier => nodeToString(use).contains(identifier.name)
