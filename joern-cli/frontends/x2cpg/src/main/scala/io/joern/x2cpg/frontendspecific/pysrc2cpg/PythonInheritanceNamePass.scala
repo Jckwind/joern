@@ -13,10 +13,15 @@ class PythonInheritanceNamePass(cpg: Cpg) extends XInheritanceFullNamePass(cpg) 
 
   override protected def xTypeFullName(importedType: String, importedPath: String): (String, String) = {
     val combinedPath = s"$importedPath$pathSep$importedType"
-    combinedPath.split(pathSep).lastOption match {
+    val parts = combinedPath.split(pathSep)
+    parts.lastOption match {
       case Some(typeName) =>
-        val modulePath = combinedPath.stripSuffix(s"$pathSep$typeName")
-        val fullName = s"$modulePath$pathSep$moduleName$pathSep$typeName"
+        val modulePath = parts.init.mkString(pathSep.toString)
+        val fullName = if (modulePath.endsWith(".py")) {
+          s"$modulePath$pathSep$moduleName$pathSep$typeName"
+        } else {
+          s"$modulePath.py$pathSep$moduleName$pathSep$typeName"
+        }
         (typeName, fullName)
       case None => (combinedPath, combinedPath)
     }

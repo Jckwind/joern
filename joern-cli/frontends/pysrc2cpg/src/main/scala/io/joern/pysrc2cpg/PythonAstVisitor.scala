@@ -514,7 +514,7 @@ class PythonAstVisitor(
     // and we cant yet handle super().
     val fakeNewMethod = createFakeNewMethod(initParameters)
 
-    val fakeNewMember = nodeBuilder.memberNode("<fakeNew>", fakeNewMethod.fullName)
+    val fakeNewMember = nodeBuilder.memberNode("<fakeNew>", None, Some(fakeNewMethod.fullName))
     edgeBuilder.astEdge(fakeNewMember, metaTypeDeclNode, contextStack.order.getAndInc)
 
     // Create binding into class instance type for each method.
@@ -569,7 +569,7 @@ class PythonAstVisitor(
     metaTypeDecl: nodes.NewNode
   ): Unit = {
     val memberForInstance =
-      nodeBuilder.memberNode(functionName, functionDefToMethod.apply(function).fullName, lineAndColOf(function))
+      nodeBuilder.memberNode(functionName, Some(lineAndColOf(function)), Some(functionDefToMethod.apply(function).fullName))
     edgeBuilder.astEdge(memberForInstance, instanceTypeDecl, contextStack.order.getAndInc)
 
     val methodForMetaClass =
@@ -584,7 +584,7 @@ class PythonAstVisitor(
         )
       }
 
-    val memberForMeta = nodeBuilder.memberNode(functionName, methodForMetaClass.fullName, lineAndColOf(function))
+    val memberForMeta = nodeBuilder.memberNode(functionName, Some(lineAndColOf(function)), Some(methodForMetaClass.fullName))
     edgeBuilder.astEdge(memberForMeta, metaTypeDecl, contextStack.order.getAndInc)
   }
 
@@ -1861,9 +1861,9 @@ class PythonAstVisitor(
       case imaginaryConstant: ast.ImaginaryConstant =>
         nodeBuilder.complexLiteralNode(imaginaryConstant.value + "j", lineAndColOf(constant))
       case ast.NoneConstant =>
-        nodeBuilder.literalNode("None", None, lineAndColOf(constant))
+        nodeBuilder.literalNode("None", List(Constants.ANY), lineAndColOf(constant))
       case ast.EllipsisConstant =>
-        nodeBuilder.literalNode("...", None, lineAndColOf(constant))
+        nodeBuilder.literalNode("...", List(Constants.ANY), lineAndColOf(constant))
     }
   }
 
@@ -1890,7 +1890,7 @@ class PythonAstVisitor(
     contextStack.findEnclosingTypeDecl() match {
       case Some(typeDecl: NewTypeDecl) =>
         if (!members.contains(typeDecl) || !members(typeDecl).contains(name)) {
-          val member = nodeBuilder.memberNode(name, lineAndCol)
+          val member = nodeBuilder.memberNode(name, Some(lineAndCol))
           edgeBuilder.astEdge(member, typeDecl, contextStack.order.getAndInc)
           members(typeDecl) = members.getOrElse(typeDecl, List()) ++ List(name)
         }
@@ -1902,9 +1902,9 @@ class PythonAstVisitor(
     subscript.slice match {
       case slice: ast.Slice =>
         val value = convert(subscript.value)
-        val lower = slice.lower.map(convert).getOrElse(nodeBuilder.literalNode("None", None, noLineAndColumn))
-        val upper = slice.upper.map(convert).getOrElse(nodeBuilder.literalNode("None", None, noLineAndColumn))
-        val step  = slice.step.map(convert).getOrElse(nodeBuilder.literalNode("None", None, noLineAndColumn))
+        val lower = slice.lower.map(convert).getOrElse(nodeBuilder.literalNode("None", List(Constants.ANY), noLineAndColumn))
+        val upper = slice.upper.map(convert).getOrElse(nodeBuilder.literalNode("None", List(Constants.ANY), noLineAndColumn))
+        val step  = slice.step.map(convert).getOrElse(nodeBuilder.literalNode("None", List(Constants.ANY), noLineAndColumn))
 
         val code = nodeToCode.getCode(subscript)
         val callNode =

@@ -42,15 +42,17 @@ class DynamicTypeHintFullNamePass(cpg: Cpg) extends ForkJoinParallelCpgPass[CfgN
       val imports = fileToImports.getOrElse(file.name, List.empty) ++ methodReturn.method.typeDecl
         .map(td => ImportScope(Option(pythonicTypeNameToImport(td.fullName)), Option(td.name)))
         .toList
-      imports
-        .filter { x =>
-          // TODO: Handle * imports correctly
-          x.alias.exists { imported => typeHint.matches(Pattern.quote(imported) + "(\\..+)*") }
+
+      // Improved matching for generic types
+      val matchedImports = imports.filter { x =>
+        x.alias.exists { imported =>
+          typeHint.split("[<,>]").head.matches(Pattern.quote(imported) + "(\\..+)*")
         }
-        .flatMap(_.entity)
-        .foreach { importedEntity =>
-          setTypeHints(diffGraph, methodReturn, typeHint, typeHint, importedEntity)
-        }
+      }
+
+      matchedImports.flatMap(_.entity).foreach { importedEntity =>
+        setTypeHints(diffGraph, methodReturn, typeHint, typeHint, importedEntity)
+      }
     }
 
   private def runOnMethodParameter(diffGraph: DiffGraphBuilder, param: MethodParameterIn): Unit =
@@ -59,14 +61,19 @@ class DynamicTypeHintFullNamePass(cpg: Cpg) extends ForkJoinParallelCpgPass[CfgN
       val imports = fileToImports.getOrElse(file.name, List.empty) ++ param.method.typeDecl
         .map(td => ImportScope(Option(pythonicTypeNameToImport(td.fullName)), Option(td.name)))
         .toList
-      imports
-        // TODO: Handle * imports correctly
-        .filter(_.alias.exists { imported => typeHint.matches(Pattern.quote(imported) + "(\\..+)*") })
-        .foreach {
-          case ImportScope(Some(importedEntity), Some(importedAs)) =>
-            setTypeHints(diffGraph, param, typeHint, importedAs, importedEntity)
-          case _ =>
+
+      // Improved matching for generic types
+      val matchedImports = imports.filter { x =>
+        x.alias.exists { imported =>
+          typeHint.split("[<,>]").head.matches(Pattern.quote(imported) + "(\\..+)*")
         }
+      }
+
+      matchedImports.foreach {
+        case ImportScope(Some(importedEntity), Some(importedAs)) =>
+          setTypeHints(diffGraph, param, typeHint, importedAs, importedEntity)
+        case _ =>
+      }
     }
 
   private def pythonicTypeNameToImport(fullName: String): String =
@@ -78,22 +85,29 @@ class DynamicTypeHintFullNamePass(cpg: Cpg) extends ForkJoinParallelCpgPass[CfgN
     typeHint: String,
     alias: String,
     importedEntity: String
-  ) = {
+  ): Unit = {
     val importFullPath   = ImportStringHandling.combinedPath(importedEntity, typeHint)
-    val typeHintFullName = typeHint.replaceFirst(Pattern.quote(alias), importedEntity)
+    val typeHintFullName = typeHint.replaceFirst(Pattern.quote(alias) + "(\\..+)*", importedEntity)
     val typeFilePath     = typeHintFullName.replaceAll("\\.", Matcher.quoteReplacement(File.separator))
     val pythonicTypeFullName = importFullPath.split("\\.").lastOption match {
       case Some(typeName) =>
         typeFilePath.stripSuffix(s"${File.separator}$typeName").concat(s".py:${Constants.moduleName}.$typeName")
       case None => typeHintFullName
     }
-    cpg.typeDecl.fullName(s".*${Pattern.quote(pythonicTypeFullName)}").l match {
-      case xs if xs.sizeIs == 1 =>
-        diffGraph.setNodeProperty(node, PropertyNames.TYPE_FULL_NAME, xs.fullName.head)
-      case xs if xs.nonEmpty =>
-        diffGraph.setNodeProperty(node, PropertyNames.DYNAMIC_TYPE_HINT_FULL_NAME, xs.fullName.toSeq)
-      case _ =>
-        diffGraph.setNodeProperty(node, PropertyNames.TYPE_FULL_NAME, pythonicTypeFullName)
+
+    // Improved type handling and error logging
+    try {
+      cpg.typeDecl.fullName(s".*${Pattern.quote(pythonicTypeFullName)}").l match {
+        case xs if xs.sizeIs == 1 =>
+          diffGraph.setNodeProperty(node, PropertyNames.TYPE_FULL_NAME, xs.fullName.head)
+        case xs if xs.nonEmpty =>
+          diffGraph.setNodeProperty(node, PropertyNames.DYNAMIC_TYPE_HINT_FULL_NAME, xs.fullName.toSeq)
+        case _ =>
+          diffGraph.setNodeProperty(node, PropertyNames.TYPE_FULL_NAME, pythonicTypeFullName)
+      }
+    } catch {
+      case e: Exception =>
+        println(s"Error setting type hints for node ${node.id}: ${e.getMessage}")
     }
   }
 }

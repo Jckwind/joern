@@ -7,7 +7,6 @@ import flatgraph.formats.ExportResult
 import flatgraph.formats.dot.DotExporter
 import flatgraph.formats.graphml.GraphMLExporter
 import flatgraph.formats.graphson.GraphSONExporter
-import flatgraph.formats.neo4jcsv.{ColumnDefinitions, ColumnType, HeaderFileSuffix, DataFileSuffix}
 import io.joern.dataflowengineoss.DefaultSemantics
 import io.joern.dataflowengineoss.layers.dataflows.*
 import io.joern.dataflowengineoss.semanticsloader.Semantics
@@ -17,7 +16,6 @@ import io.shiftleft.codepropertygraph.generated.Cpg
 import io.shiftleft.codepropertygraph.generated.NodeTypes
 import io.shiftleft.semanticcpg.language.*
 import io.shiftleft.semanticcpg.layers.*
-
 import com.github.tototoshi.csv.*
 import flatgraph.formats.{ExportResult, Exporter, writeFile}
 import flatgraph.{Edge, GNode, Graph, Schema}
@@ -27,6 +25,11 @@ import scala.jdk.CollectionConverters.IteratorHasAsScala
 import scala.util.Using
 import scala.util.{Try, Success, Failure}
 import scala.jdk.OptionConverters.RichOptional
+import flatgraph.formats.iterableForList
+
+import scala.collection.immutable.ArraySeq
+import scala.collection.mutable
+import scala.jdk.CollectionConverters.IterableHasAsScala
 
 object JoernExport {
 
@@ -263,7 +266,7 @@ object JoernExport {
     try {
       val exportResult = repr match {
         case Representation.All | Representation.Cpg | Representation.Ast | Representation.Cfg | Representation.Ddg | Representation.Cdg | Representation.Pdg | Representation.Cpg14 =>
-          Neo4jCsvExporter.runExport(cpg.graph.schema, cpg.graph.nodes().toSeq, cpg.graph.allEdges.toSeq, outDir)
+          Neo4jCsvExporter.runExport(cpg.graph.schema, cpg.graph.allNodes.toSeq, cpg.graph.allEdges.toSeq, outDir)
 
         case other =>
           throw new NotImplementedError(s"repr=$repr not yet supported for this format")
@@ -290,6 +293,48 @@ object JoernExport {
 object Neo4jCsvExporter extends Exporter {
 
   override def defaultFileExtension: String = "csv"
+
+  private[Neo4jCsvExporter] object FileType extends Enumeration {
+    val Nodes, Relationships = Value
+  }
+
+  val HeaderFileSuffix = "_header"
+  val DataFileSuffix   = "_data"
+  val CypherFileSuffix = "_cypher"
+
+  object ColumnType extends Enumeration {
+    // defining 'stable' string so we can pattern match on them
+    val LabelMarker = ":LABEL"
+    val TypeMarker  = ":TYPE"
+    val ArrayMarker = "[]"
+
+    // special types for nodes
+    val Id    = Value(":ID")
+    val Label = Value(LabelMarker)
+
+    // special types for relationships
+    val Type    = Value(TypeMarker)
+    val StartId = Value(":START_ID")
+    val EndId   = Value(":END_ID")
+
+    // regular data types
+    val Int           = Value("int")
+    val Long          = Value("long")
+    val Float         = Value("float")
+    val Double        = Value("double")
+    val Boolean       = Value("boolean")
+    val Byte          = Value("byte")
+    val Short         = Value("short")
+    val Char          = Value("char")
+    val String        = Value("string")
+    val Point         = Value("point")
+    val Date          = Value("date")
+    val LocalTime     = Value("localtime")
+    val Time          = Value("time")
+    val LocalDateTime = Value("localdatetime")
+    val DateTime      = Value("datetime")
+    val Duration      = Value("duration")
+  }
 
   /**
     *
@@ -336,7 +381,10 @@ object Neo4jCsvExporter extends Exporter {
         nodes.iterator.foreach { node =>
           try {
             val specialColumns = Seq(node.id.toString, node.label)
-            var properties = Accessors.getNodeProperties(node).toMap
+            import scala.jdk.CollectionConverters._
+            for ((key, value) <- node.propertiesMap.asScala) {
+              columnDefinitions.updateWith(key, value)
+            }
             val propertyValueColumns = columnDefinitions.propertyValues(node.propertyOption)
             writer.writeRow(specialColumns ++ propertyValueColumns)
             nodeCount += 1
@@ -365,37 +413,45 @@ object Neo4jCsvExporter extends Exporter {
     writeSingleLineCsv(headerFile, Seq(ColumnType.Id, ColumnType.Label) ++ columnDefinitions.propertiesWithTypes)
     CountAndFiles(nodeCount, Seq(headerFile, dataFile))
   }
-
-  /** write edges of all labels */
+  
   private def exportEdges(edges: IterableOnce[Edge], outputRootDirectory: Path): CountAndFiles = {
     val edgeFilesContextByLabel = mutable.Map.empty[String, EdgeFilesContext]
-    var count                   = 0
+    var count = 0
 
+    // Map to store properties of each edge, keyed by (srcId, dstId, label)
+    // PERFORMANCE NOTE: This map could potentially consume a large amount of memory for graphs with many edges
+    val edgeProperties = mutable.Map.empty[(Long, Long, String), mutable.Map[String, Any]]
+
+    // Iterate over all edges to collect their properties
+    // PERFORMANCE NOTE: This iteration could be slow for large graphs, as it processes all edges in memory
     edges.iterator.foreach { edge =>
-      val label = edge.label
+      val key = (edge.src.id, edge.dst.id, edge.label)
+      val properties = edgeProperties.getOrElseUpdate(key, mutable.Map.empty[String, Any])
+      edge.propertyName.foreach { name =>
+        edge.propertyMaybe.foreach { value =>
+          properties(name) = value
+        }
+      }
+    }
+
+    // Iterate over the collected edge properties to write them to the CSV
+    // PERFORMANCE NOTE: This second iteration over all edges could be slow for large graphs
+    edgeProperties.foreach { case ((srcId, dstId, label), properties) =>
       val context = edgeFilesContextByLabel.getOrElseUpdate(
         label, {
-          // first time we encounter an edge of this type - create the columnMapping and write the header file
-          val headerFile        = outputRootDirectory.resolve(s"edges_$label$HeaderFileSuffix.csv")
-          // header file to be written at the very end, with complete ColumnDefByName
-          val dataFile          = outputRootDirectory.resolve(s"edges_$label$DataFileSuffix.csv")
-          val dataFileWriter    = CSVWriter.open(dataFile.toFile, append = false)
-          val columnDefinitions = new ColumnDefinitions(edge.propertyName.toList) // flatgraph only supports edges with 1 property
-          println(s"label: $label")
-          println(s"edge.propertyName: ${edge.propertyName}")
-          println(s"columnDefinitions: ${columnDefinitions.propertiesWithTypes}")
+          // First time we encounter an edge of this type - create the columnMapping and write the header file
+          val headerFile = outputRootDirectory.resolve(s"edges_${sanitizeLabel(label)}$HeaderFileSuffix.csv")
+          val dataFile = outputRootDirectory.resolve(s"edges_${sanitizeLabel(label)}$DataFileSuffix.csv")
+          // PERFORMANCE NOTE: Opening a new file writer for each edge type could lead to many open file handles
+          val dataFileWriter = CSVWriter.open(dataFile.toFile, append = false)
+          val columnDefinitions = new ColumnDefinitions(properties.keys.toList)
           EdgeFilesContext(label, headerFile, dataFile, dataFileWriter, columnDefinitions)
         }
       )
 
-      val specialColumns = Seq(edge.src.id.toString, edge.dst.id.toString, edge.label)
+      val specialColumns = Seq(srcId.toString, dstId.toString, label)
       val propertyValueColumns = context.columnDefinitions.propertyValues { propertyName =>
-        edge.propertyName.flatMap { edgePropertyName =>
-          if (propertyName == edgePropertyName)
-            edge.propertyMaybe
-          else
-            None
-        }
+        properties.get(propertyName)
       }
       context.dataFileWriter.writeRow(specialColumns ++ propertyValueColumns)
       count += 1
@@ -403,7 +459,6 @@ object Neo4jCsvExporter extends Exporter {
 
     val files = edgeFilesContextByLabel.values.flatMap {
       case EdgeFilesContext(label, headerFile, dataFile, dataFileWriter, columnDefinitions) =>
-        println(s"columnDefinitions: ${columnDefinitions.propertiesWithTypes}")
         writeSingleLineCsv(headerFile, Seq(ColumnType.StartId, ColumnType.EndId, ColumnType.Type) ++ columnDefinitions.propertiesWithTypes)
 
         dataFileWriter.flush()
@@ -437,5 +492,179 @@ object Neo4jCsvExporter extends Exporter {
     def plus(other: CountAndFiles): CountAndFiles =
       CountAndFiles(count + other.count, files ++ other.files)
   }
+
+  private[Neo4jCsvExporter] class ColumnDefinitions(propertyNames: Iterable[String]) {
+    sealed trait ColumnDef
+  case class ScalarColumnDef(valueType: ColumnType.Value)                                              extends ColumnDef
+  case class ArrayColumnDef(valueType: Option[ColumnType.Value], iteratorAccessor: Any => Iterable[?]) extends ColumnDef
+    private val propertyNamesOrdered     = propertyNames.toSeq.sorted
+    private val _columnDefByPropertyName = mutable.Map.empty[String, ColumnDef]
+
+    def columnDefByPropertyName(name: String): Option[ColumnDef] = _columnDefByPropertyName.get(name)
+
+    def updateWith(propertyName: String, value: Any): ColumnDef = {
+      _columnDefByPropertyName
+        .updateWith(propertyName) {
+          case None =>
+            // we didn't see this property before - try to derive it's type from the runtime class
+            Option(deriveNeo4jType(value))
+          case Some(ArrayColumnDef(None, _)) =>
+            // value is an array that we've seen before, but we don't have the valueType yet, most likely because previous occurrences were empty arrays
+            Option(deriveNeo4jType(value))
+          case completeDef =>
+            completeDef // we already have everything we need, no need to change anything
+        }
+        .get
+    }
+
+    /** for header file */
+    def propertiesWithTypes: Seq[String] = {
+      propertyNamesOrdered.map { name =>
+        columnDefByPropertyName(name) match {
+          case Some(ScalarColumnDef(valueType)) =>
+            s"$name:$valueType"
+          case Some(ArrayColumnDef(Some(valueType), _)) =>
+            s"$name:$valueType[]"
+          case _ =>
+            name
+        }
+      }
+    }
+
+    /** for data file updates our internal `_columnDefByPropertyName` model with type information based on runtime values, so that we later
+      * have all metadata required for the header file
+      */
+    def propertyValues(byNameAccessor: String => Option[?]): Seq[String] = {
+      propertyNamesOrdered.map { propertyName =>
+        byNameAccessor(propertyName) match {
+          case None =>
+            "" // property value empty for this element
+          case Some(value) =>
+            updateWith(propertyName, value) match {
+              case ScalarColumnDef(_) =>
+                value.toString // scalar property value
+              case ArrayColumnDef(_, iteratorAccessor) =>
+                /** Array property value - separated by `;` according to the spec
+                  *
+                  * Note: if all instances of this array property type are empty, we will not have the valueType (because it's derived from
+                  * the runtime class). At the same time, it doesn't matter for serialization, because the csv entry is always empty for all
+                  * empty arrays.
+                  */
+                iteratorAccessor(value).mkString(";")
+            }
+        }
+      }
+    }
+
+    /** for cypher file <rant> why does neo4j have 4 different ways to import a CSV, out of which only one works, and really the only help we
+      * get is a csv file reader, and we need to specify exactly how each column needs to be parsed and mapped...? </rant>
+      */
+    def propertiesMappingsForCypher(startIndex: Int): Seq[String] = {
+      var idx = startIndex - 1
+      propertyNamesOrdered.map { name =>
+        idx += 1
+        val accessor = s"line[$idx]"
+        columnDefByPropertyName(name) match {
+          case Some(ScalarColumnDef(columnType)) =>
+            val adaptedAccessor =
+              cypherScalarConversionFunctionMaybe(columnType)
+                .map(f => s"$f($accessor)")
+                .getOrElse(accessor)
+            s"$name: $adaptedAccessor"
+          case Some(ArrayColumnDef(columnType, _)) =>
+            val accessor = s"""split(line[$idx], ";")"""
+            val adaptedAccessor =
+              columnType
+                .flatMap(cypherListConversionFunctionMaybe)
+                .map(f => s"$f($accessor)")
+                .getOrElse(accessor)
+            s"$name: $adaptedAccessor"
+          case None =>
+            s"$name: $accessor"
+        }
+      }
+    }
+
+    /** optionally choose one of https://neo4j.com/docs/cypher-manual/current/functions/scalar/, depending on the columnType
+      */
+    private def cypherScalarConversionFunctionMaybe(columnType: ColumnType.Value): Option[String] = {
+      columnType match {
+        case ColumnType.Id | ColumnType.Int | ColumnType.Long | ColumnType.Byte | ColumnType.Short =>
+          Some("toInteger")
+        case ColumnType.Float | ColumnType.Double =>
+          Some("toFloat")
+        case ColumnType.Boolean =>
+          Some("toBoolean")
+        case _ => None
+      }
+    }
+
+    /** optionally choose one of https://neo4j.com/docs/cypher-manual/current/functions/list/#functions-tobooleanlist, depending on the
+      * columnType
+      */
+    private def cypherListConversionFunctionMaybe(columnType: ColumnType.Value): Option[String] = {
+      columnType match {
+        case ColumnType.Id | ColumnType.Int | ColumnType.Long | ColumnType.Byte | ColumnType.Short =>
+          Some("toIntegerList")
+        case ColumnType.Float | ColumnType.Double =>
+          Some("toFloatList")
+        case ColumnType.Boolean =>
+          Some("toBooleanList")
+        case ColumnType.String =>
+          Some("toStringList")
+        case _ => None
+      }
+    }
+
+    /** derive property types based on the runtime class note: this ignores the edge case that there may be different runtime types for the
+      * same property
+      */
+    private def deriveNeo4jType(value: Any): ColumnDef = {
+      def deriveNeo4jTypeForArray(iteratorAccessor: Any => Iterable[?]): ArrayColumnDef = {
+        // Iterable is immutable, so we can safely (try to) get it's first element
+        val valueTypeMaybe = iteratorAccessor(value).iterator
+          .nextOption()
+          .map(_.getClass)
+          .map(deriveNeo4jTypeForScalarValue)
+        ArrayColumnDef(valueTypeMaybe, iteratorAccessor)
+      }
+
+      value match {
+        case _: Iterable[_] =>
+          deriveNeo4jTypeForArray(_.asInstanceOf[Iterable[?]])
+        case _: IterableOnce[_] =>
+          deriveNeo4jTypeForArray(_.asInstanceOf[IterableOnce[?]].iterator.toSeq)
+        case _: java.lang.Iterable[_] =>
+          deriveNeo4jTypeForArray(_.asInstanceOf[java.lang.Iterable[?]].asScala)
+        case _: Array[_] =>
+          deriveNeo4jTypeForArray(x => ArraySeq.unsafeWrapArray(x.asInstanceOf[Array[?]]))
+        case scalarValue =>
+          ScalarColumnDef(deriveNeo4jTypeForScalarValue(scalarValue.getClass))
+      }
+    }
+
+    private def deriveNeo4jTypeForScalarValue(clazz: Class[?]): ColumnType.Value = {
+      if (clazz == classOf[String])
+        ColumnType.String
+      else if (clazz == classOf[Int] || clazz == classOf[Integer] || clazz == classOf[Long] || clazz == classOf[java.lang.Long])
+        // neo4j prefers Long over Int
+        ColumnType.Long
+      else if (clazz == classOf[Float] || clazz == classOf[java.lang.Float])
+        ColumnType.Float
+      else if (clazz == classOf[Double] || clazz == classOf[java.lang.Double])
+        ColumnType.Double
+      else if (clazz == classOf[Boolean] || clazz == classOf[java.lang.Boolean])
+        ColumnType.Boolean
+      else if (clazz == classOf[Byte] || clazz == classOf[java.lang.Byte])
+        ColumnType.Byte
+      else if (clazz == classOf[Short] || clazz == classOf[java.lang.Short])
+        ColumnType.Short
+      else if (clazz == classOf[Char])
+        ColumnType.Char
+      else
+        throw new NotImplementedError(s"unable to derive a Neo4j type for given runtime type $clazz")
+    }
+  }
+
 
 }

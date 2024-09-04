@@ -13,11 +13,10 @@ import scopt.OParser
 import java.nio.file.Paths
 import java.nio.file.Path
 import scala.util.Try
-import scala.compiletime.uninitialized
 
 case class PythonSrcCpgGenerator(config: FrontendConfig, rootPath: Path) extends CpgGenerator {
   private lazy val command: Path = if (isWin) rootPath.resolve("pysrc2cpg.bat") else rootPath.resolve("pysrc2cpg")
-  private var typeRecoveryConfig: XTypeRecoveryConfig = uninitialized
+  private var typeRecoveryConfig: XTypeRecoveryConfig = null
 
   /** Generate a CPG for the given input path. Returns the output path, or None, if no CPG was generated.
     */
@@ -33,7 +32,10 @@ case class PythonSrcCpgGenerator(config: FrontendConfig, rootPath: Path) extends
     command.toFile.exists
 
   override def applyPostProcessingPasses(cpg: Cpg): Cpg = {
-    pysrc2cpg.postProcessingPasses(cpg, typeRecoveryConfig).foreach(_.createAndApply())
+    if (typeRecoveryConfig != null) {
+      typeRecoveryConfig = XTypeRecoveryConfig.parse(first_two_params)
+      pysrc2cpg.postProcessingPasses(cpg, typeRecoveryConfig).foreach(_.createAndApply())
+    }
 
     cpg
   }

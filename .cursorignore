@@ -1,0 +1,26 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+# Ignore build and IDE directories
+.bloop
+.devcontainer
+.local
+.metals
+
+# Ignore changelog and CI directories
+changelog
+ci
+
+# Ignore library and macro directories
+lib
+macros
+
+# Ignore project and query database directories
+project
+querydb
+
+# Ignore script directories
+scripts/*
+
+# Ignore target directory and its contents
+target/*
+
+tests/*
